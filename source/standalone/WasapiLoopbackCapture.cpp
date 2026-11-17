@@ -2,8 +2,9 @@
 // WasapiLoopbackCapture.cpp
 //   使用 WASAPI 做回环采集，两种目标（见头文件）：
 //
-//   A) 整机输出 —— "默认渲染端点（扬声器/耳机）" 的混音输出信号
-//     - IMMDeviceEnumerator::GetDefaultAudioEndpoint(eRender, eConsole)
+//   A) 整机输出 —— 某个渲染端点（扬声器/耳机）的混音输出信号
+//     - 默认设备：IMMDeviceEnumerator::GetDefaultAudioEndpoint(eRender, eConsole)
+//       指定设备：IMMDeviceEnumerator::GetDevice(endpointId)
 //     - IAudioClient::Initialize(AUDCLNT_SHAREMODE_SHARED,
 //                                AUDCLNT_STREAMFLAGS_LOOPBACK
 //                              | AUDCLNT_STREAMFLAGS_EVENTCALLBACK? (这里用轮询，更简单) ,
@@ -44,7 +45,9 @@
 #include <wrl/client.h>
 #include <wrl/implements.h>
 
+#include <algorithm>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -266,6 +269,17 @@ namespace
                     onAudio (bufL.data(), bufR.data(), frames, sampleRate);
             }
         }
+
+        // 没有流可采的等待期：5ms 一步补静音（与采集循环的轮询节奏一致），共 steps 步；
+        //   stop() 最多迟滞一步
+        void idle (double sampleRate, int steps, const std::atomic<bool>& shouldStop)
+        {
+            for (int step = 0; step < steps && ! shouldStop.load (std::memory_order_acquire); ++step)
+            {
+                emitSilenceIfDue (sampleRate);
+                Sleep (5);
+            }
+        }
     };
 
     // 定向程序模式：盯着目标进程是否还活着
@@ -309,14 +323,16 @@ namespace
         JUCE_DECLARE_NON_COPYABLE (TargetWatch)
     };
 
-    // 采集主循环：两种目标共用。返回 = stop() / 采集流失效 / 目标程序退出。
-    //   dataEvent / watch 为空 = 整机输出模式（纯轮询、不关心进程死活）。
-    void pumpCapture (IAudioCaptureClient*      captureClient,
-                      const WAVEFORMATEX*       format,
-                      HANDLE                    dataEvent,
-                      TargetWatch*              watch,
-                      const std::atomic<bool>&  shouldStop,
-                      CaptureSink&              sink)
+    // 采集主循环：两种目标共用。返回 = stop() / 采集流失效 / shouldLeave() 说该走了。
+    //   · dataEvent 为空 = 纯轮询（整机输出模式）。
+    //   · shouldLeave 只在"此刻没有数据"的空档里问（可为空）：
+    //     定向程序 = 目标退出了；整机输出跟随默认设备 = 默认设备换了。
+    void pumpCapture (IAudioCaptureClient*          captureClient,
+                      const WAVEFORMATEX*           format,
+                      HANDLE                        dataEvent,
+                      const std::function<bool()>&  shouldLeave,
+                      const std::atomic<bool>&      shouldStop,
+                      CaptureSink&                  sink)
     {
         const double sampleRate = (double) format->nSamplesPerSec;
 
@@ -332,7 +348,7 @@ namespace
 
             if (packetLength == 0)
             {
-                if (watch != nullptr && watch->exited())
+                if (shouldLeave && shouldLeave())
                     return;
 
                 sink.emitSilenceIfDue (sampleRate);
@@ -378,18 +394,86 @@ namespace
         }
     }
 
-    // 打开"默认"渲染端点（就是系统当前外放设备）的 IAudioClient 并取它的 mix format。
-    //   成功返回空串，失败返回错误描述。
-    juce::String openDefaultRenderClient (ComPtr<IAudioClient>& client, MixFormatPtr& mixFormat)
+    // 失败时返回空指针
+    ComPtr<IMMDeviceEnumerator> createDeviceEnumerator()
     {
         ComPtr<IMMDeviceEnumerator> enumerator;
-        if (FAILED (CoCreateInstance (__uuidof (MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                                      IID_PPV_ARGS (enumerator.GetAddressOf()))))
+        CoCreateInstance (__uuidof (MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                          IID_PPV_ARGS (enumerator.GetAddressOf()));
+        return enumerator;
+    }
+
+    // 系统当前的默认播放端点；没有播放设备时返回空指针
+    ComPtr<IMMDevice> defaultRenderDevice (IMMDeviceEnumerator* enumerator)
+    {
+        ComPtr<IMMDevice> device;
+        if (enumerator == nullptr
+            || FAILED (enumerator->GetDefaultAudioEndpoint (eRender, eConsole, &device)))
+            device.Reset();
+        return device;
+    }
+
+    juce::String endpointIdOf (IMMDevice* device)
+    {
+        juce::String id;
+        LPWSTR raw = nullptr;
+        if (device != nullptr && SUCCEEDED (device->GetId (&raw)) && raw != nullptr)
+            id = juce::String (raw);
+        CoTaskMemFree (raw);
+        return id;
+    }
+
+    // 端点的 ID + 给用户看的名字（"扬声器 (Realtek(R) Audio)"）；名字读不到时退回 ID
+    WasapiLoopbackCapture::RenderEndpoint describeEndpoint (IMMDevice* device)
+    {
+        WasapiLoopbackCapture::RenderEndpoint endpoint;
+        endpoint.id = endpointIdOf (device);
+        if (endpoint.id.isEmpty())
+            return endpoint;
+
+        ComPtr<IPropertyStore> props;
+        if (SUCCEEDED (device->OpenPropertyStore (STGM_READ, &props)) && props != nullptr)
+        {
+            PROPVARIANT value;
+            PropVariantInit (&value);
+            if (SUCCEEDED (props->GetValue (PKEY_Device_FriendlyName, &value))
+                && value.vt == VT_LPWSTR && value.pwszVal != nullptr)
+                endpoint.name = juce::String (value.pwszVal).trim();
+            PropVariantClear (&value);
+        }
+
+        if (endpoint.name.isEmpty())
+            endpoint.name = endpoint.id;
+        return endpoint;
+    }
+
+    // 打开一个渲染端点的 IAudioClient 并取它的 mix format。
+    //   endpointId 为空 = 系统当前的默认播放设备；openedId（可选）带回实际打开的端点 ID。
+    //   成功返回空串，失败返回错误描述。
+    juce::String openRenderClient (IMMDeviceEnumerator*   enumerator,
+                                   const juce::String&    endpointId,
+                                   ComPtr<IAudioClient>&  client,
+                                   MixFormatPtr&          mixFormat,
+                                   juce::String*          openedId = nullptr)
+    {
+        if (enumerator == nullptr)
             return "CoCreateInstance(MMDeviceEnumerator) failed";
 
         ComPtr<IMMDevice> device;
-        if (FAILED (enumerator->GetDefaultAudioEndpoint (eRender, eConsole, &device)) || device == nullptr)
-            return "GetDefaultAudioEndpoint(eRender) failed; no active playback device?";
+        if (endpointId.isEmpty())
+        {
+            device = defaultRenderDevice (enumerator);
+            if (device == nullptr)
+                return "GetDefaultAudioEndpoint(eRender) failed; no active playback device?";
+        }
+        else
+        {
+            // 被拔掉 / 禁用的端点 GetDevice 仍可能成功，要再看一眼状态
+            DWORD state = 0;
+            if (FAILED (enumerator->GetDevice (endpointId.toWideCharPointer(), &device)) || device == nullptr
+                || FAILED (device->GetState (&state)) || state != DEVICE_STATE_ACTIVE)
+                return "The selected playback device is not available (unplugged or disabled).";
+        }
 
         if (FAILED (device->Activate (__uuidof (IAudioClient), CLSCTX_ALL, nullptr,
                                       (void**) client.ReleaseAndGetAddressOf())))
@@ -400,8 +484,105 @@ namespace
             return "IAudioClient::GetMixFormat failed";
 
         mixFormat.reset (format);
+        if (openedId != nullptr)
+            *openedId = endpointIdOf (device.Get());
         return {};
     }
+
+    // 一条回环采集流的公共部分（两种目标共用）：IAudioClient + 采集接口，析构时停流。
+    struct LoopbackStream
+    {
+        ComPtr<IAudioClient>        client;
+        ComPtr<IAudioCaptureClient> capture;
+
+        ~LoopbackStream() { stopStream(); }
+
+        void stopStream()
+        {
+            capture.Reset();
+            if (client != nullptr)
+            {
+                client->Stop();
+                client.Reset();
+            }
+        }
+
+        // client 已 Initialize 之后：取采集接口并让流跑起来。成功返回空串，失败返回错误描述
+        juce::String startCapture()
+        {
+            HRESULT hr = client->GetService (__uuidof (IAudioCaptureClient), (void**) capture.ReleaseAndGetAddressOf());
+            if (FAILED (hr) || capture == nullptr)
+                return "IAudioClient::GetService(IAudioCaptureClient) failed (" + hrText (hr) + ")";
+
+            hr = client->Start();
+            if (FAILED (hr))
+                return "IAudioClient::Start failed (" + hrText (hr) + ")";
+
+            return {};
+        }
+    };
+
+    // 一条渲染端点回环采集流（整机输出）。open() 失败后不要复用本对象。
+    struct EndpointStream : LoopbackStream
+    {
+        MixFormatPtr mixFormat;
+        juce::String endpointId;   // 实际打开的端点
+
+        // 成功返回空串，失败返回错误描述
+        juce::String open (IMMDeviceEnumerator* enumerator, const juce::String& targetEndpointId)
+        {
+            const juce::String openError = openRenderClient (enumerator, targetEndpointId,
+                                                             client, mixFormat, &endpointId);
+            if (openError.isNotEmpty())
+                return openError;
+
+            // 100ms buffer（REFERENCE_TIME 单位 = 100ns）
+            const REFERENCE_TIME bufferDuration = 10 * 1000 * 100;
+            const HRESULT hr = client->Initialize (AUDCLNT_SHAREMODE_SHARED,
+                                                   AUDCLNT_STREAMFLAGS_LOOPBACK,
+                                                   bufferDuration,
+                                                   0,
+                                                   mixFormat.get(),
+                                                   nullptr);
+            if (FAILED (hr))
+                return "IAudioClient::Initialize(LOOPBACK) failed (" + hrText (hr) + ")";
+
+            return startCapture();
+        }
+    };
+
+    // 整机输出跟随默认设备时：盯着系统的默认播放设备有没有换成别的端点。
+    //   每秒问一次系统（一次进程内 COM 调用，很轻），比注册 IMMNotificationClient 简单得多。
+    class DefaultEndpointWatch
+    {
+    public:
+        DefaultEndpointWatch (IMMDeviceEnumerator* deviceEnumerator, const juce::String& openedEndpointId)
+            : enumerator (deviceEnumerator),
+              openedId (openedEndpointId)
+        {
+        }
+
+        bool moved()
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastPoll < std::chrono::seconds (1))
+                return false;
+
+            lastPoll = now;
+
+            // 读不到默认设备（所有播放设备都没了）不算"换了"：
+            //   真没了的话采集流自己会失效，由采集循环走等待 / 重连
+            const juce::String current = endpointIdOf (defaultRenderDevice (enumerator.Get()).Get());
+            return current.isNotEmpty() && current != openedId;
+        }
+
+    private:
+        const ComPtr<IMMDeviceEnumerator> enumerator;
+        const juce::String                openedId;
+        std::chrono::steady_clock::time_point lastPoll = std::chrono::steady_clock::now();
+
+        JUCE_DECLARE_NON_COPYABLE (DefaultEndpointWatch)
+    };
 
     // ------------------------------------------------------
     // ActivateAudioInterfaceAsync 的完成回调（与微软 ApplicationLoopback 示例同一写法）。
@@ -483,21 +664,14 @@ namespace
     };
 
     // 一条进程级回环采集流。open() 失败后不要复用本对象（已拿到的资源由析构回收）。
-    struct ProcessStream
+    struct ProcessStream : LoopbackStream
     {
-        ComPtr<IAudioClient>        client;
-        ComPtr<IAudioCaptureClient> capture;
-        HANDLE                      dataEvent = nullptr;
-        WAVEFORMATEXTENSIBLE        format {};
+        HANDLE               dataEvent = nullptr;
+        WAVEFORMATEXTENSIBLE format {};
 
         ~ProcessStream()
         {
-            capture.Reset();
-            if (client != nullptr)
-            {
-                client->Stop();
-                client.Reset();
-            }
+            stopStream();   // 先停流，再关它还在用的事件句柄
             if (dataEvent != nullptr)
                 CloseHandle (dataEvent);
         }
@@ -542,15 +716,7 @@ namespace
             if (FAILED (hr))
                 return "IAudioClient::SetEventHandle failed (" + hrText (hr) + ")";
 
-            hr = client->GetService (__uuidof (IAudioCaptureClient), (void**) capture.ReleaseAndGetAddressOf());
-            if (FAILED (hr) || capture == nullptr)
-                return "IAudioClient::GetService(IAudioCaptureClient) failed (" + hrText (hr) + ")";
-
-            hr = client->Start();
-            if (FAILED (hr))
-                return "IAudioClient::Start failed (" + hrText (hr) + ")";
-
-            return {};
+            return startCapture();
         }
     };
 } // namespace
@@ -568,6 +734,52 @@ void WasapiLoopbackCapture::setTargetProcess (const juce::String& exeName)
         return;   // 运行中不允许改目标：采集线程正在读 targetExeName
 
     targetExeName = exeName.trim();
+}
+
+void WasapiLoopbackCapture::setTargetEndpoint (const juce::String& endpointId)
+{
+    if (captureThread != nullptr)
+        return;   // 运行中不允许改目标：采集线程正在读 targetEndpointId
+
+    targetEndpointId = endpointId.trim();
+}
+
+juce::Array<WasapiLoopbackCapture::RenderEndpoint> WasapiLoopbackCapture::listRenderEndpoints()
+{
+    juce::Array<RenderEndpoint> result;
+
+    const auto enumerator = createDeviceEnumerator();
+    ComPtr<IMMDeviceCollection> devices;
+    if (enumerator == nullptr
+        || FAILED (enumerator->EnumAudioEndpoints (eRender, DEVICE_STATE_ACTIVE, &devices))
+        || devices == nullptr)
+        return result;
+
+    const juce::String defaultId = endpointIdOf (defaultRenderDevice (enumerator.Get()).Get());
+
+    UINT count = 0;
+    devices->GetCount (&count);
+
+    for (UINT i = 0; i < count; ++i)
+    {
+        ComPtr<IMMDevice> device;
+        if (FAILED (devices->Item (i, &device)))
+            continue;
+
+        auto endpoint = describeEndpoint (device.Get());
+        if (endpoint.id.isEmpty())
+            continue;
+
+        endpoint.isDefault = (endpoint.id == defaultId);
+        result.add (std::move (endpoint));
+    }
+
+    std::sort (result.begin(), result.end(), [] (const RenderEndpoint& a, const RenderEndpoint& b)
+    {
+        return a.name.compareIgnoreCase (b.name) < 0;
+    });
+
+    return result;
 }
 
 void WasapiLoopbackCapture::fail (const juce::String& message)
@@ -648,43 +860,64 @@ void WasapiLoopbackCapture::runCaptureThread()
 }
 
 // ----------------------------------------------------------
-// A) 整机输出：默认渲染端点回环
+// A) 整机输出：渲染端点回环（默认播放设备 / 指定播放设备）
+//
+//   状态机（循环直到 stop()）：
+//     采集 ──(设备被拔 / 禁用 / 流失效)──▶ 等待 ──(设备可用)──▶ 采集
+//     采集 ──(跟随默认设备，且默认设备换了)──▶ 立刻改采新的默认设备
+//   · 第一次就开不起来 = start() 失败（上层弹窗 + 回退）；
+//     运行起来之后的失败只是回到等待，稍后重试。
+//   · 等待期间按墙钟节奏输出静音，表头照常归零、波形照常滚动。
+//   · 换了端点采样率可能跟着变：onAudio 每次都带采样率，上层据此重新 prepare。
 // ----------------------------------------------------------
 void WasapiLoopbackCapture::runEndpointCapture()
 {
-    ComPtr<IAudioClient> audioClient;
-    MixFormatPtr         mixFormat;
+    const bool followDefault = targetEndpointId.isEmpty();
 
-    const juce::String openError = openDefaultRenderClient (audioClient, mixFormat);
-    if (openError.isNotEmpty())
-        return fail (openError);
-
-    // 100ms buffer（REFERENCE_TIME 单位 = 100ns）
-    const REFERENCE_TIME bufferDuration = 10 * 1000 * 100;
-    HRESULT hr = audioClient->Initialize (AUDCLNT_SHAREMODE_SHARED,
-                                          AUDCLNT_STREAMFLAGS_LOOPBACK,
-                                          bufferDuration,
-                                          0,
-                                          mixFormat.get(),
-                                          nullptr);
-    if (FAILED (hr))
-        return fail ("IAudioClient::Initialize(LOOPBACK) failed (" + hrText (hr) + ")");
-
-    ComPtr<IAudioCaptureClient> captureClient;
-    hr = audioClient->GetService (__uuidof (IAudioCaptureClient), (void**) captureClient.GetAddressOf());
-    if (FAILED (hr))
-        return fail ("IAudioClient::GetService(IAudioCaptureClient) failed");
-
-    hr = audioClient->Start();
-    if (FAILED (hr))
-        return fail ("IAudioClient::Start failed");
-
-    running.store (true, std::memory_order_release);
+    // 整个线程共用一个枚举器：开流、重连、盯默认设备都用它
+    const auto enumerator = createDeviceEnumerator();
+    if (enumerator == nullptr)
+        return fail ("CoCreateInstance(MMDeviceEnumerator) failed");
 
     CaptureSink sink (onAudio);
-    pumpCapture (captureClient.Get(), mixFormat.get(), nullptr, nullptr, shouldStop, sink);
+    double      sampleRate = 48000.0;   // 等待期静音用的采样率：沿用最近一次采集的
 
-    audioClient->Stop();
+    while (! shouldStop.load (std::memory_order_acquire))
+    {
+        bool defaultMoved = false;
+
+        {
+            EndpointStream stream;
+            const juce::String error = stream.open (enumerator.Get(), targetEndpointId);
+
+            if (error.isEmpty())
+            {
+                // 首次开流：静音节拍从流真正跑起来的时刻起算（开流的耗时不算进要补的静音）。
+                //   重连时不重置 —— 等待期一直在补静音，开流这一小段空白接着补上，时间轴不断。
+                if (! running.load (std::memory_order_acquire))
+                    sink.pacer.noteRealData();
+
+                running.store (true, std::memory_order_release);
+                sampleRate = (double) stream.mixFormat->nSamplesPerSec;
+
+                // 跟随默认设备时，采集的空档里顺便看默认设备换没换
+                DefaultEndpointWatch watch (enumerator.Get(), stream.endpointId);
+                pumpCapture (stream.capture.Get(), stream.mixFormat.get(), nullptr,
+                             [&] { return followDefault && (defaultMoved = watch.moved()); },
+                             shouldStop, sink);
+            }
+            else if (! running.load (std::memory_order_acquire))
+            {
+                return fail (error);
+            }
+        }
+
+        if (defaultMoved)
+            continue;   // 默认设备换了：不等，直接去开新的
+
+        // 设备不可用（或刚断开）：等约 1 秒再试，期间持续补静音
+        sink.idle (sampleRate, 200, shouldStop);
+    }
 }
 
 // ----------------------------------------------------------
@@ -705,7 +938,8 @@ void WasapiLoopbackCapture::runProcessCapture()
     {
         ComPtr<IAudioClient> client;
         MixFormatPtr         mixFormat;
-        if (openDefaultRenderClient (client, mixFormat).isEmpty() && mixFormat->nSamplesPerSec >= 8000)
+        if (openRenderClient (createDeviceEnumerator().Get(), {}, client, mixFormat).isEmpty()
+            && mixFormat->nSamplesPerSec >= 8000)
             sampleRate = (double) mixFormat->nSamplesPerSec;
     }
 
@@ -726,8 +960,8 @@ void WasapiLoopbackCapture::runProcessCapture()
 
                 // 返回 = stop() / 目标退出 / 流失效；后两种落到下面的等待，稍后重新解析目标
                 TargetWatch watch (pid, targetExeName);
-                pumpCapture (stream.capture.Get(), &stream.format.Format,
-                             stream.dataEvent, &watch, shouldStop, sink);
+                pumpCapture (stream.capture.Get(), &stream.format.Format, stream.dataEvent,
+                             [&watch] { return watch.exited(); }, shouldStop, sink);
             }
             else if (! running.load (std::memory_order_acquire))
             {
@@ -742,13 +976,8 @@ void WasapiLoopbackCapture::runProcessCapture()
         // 目标没在运行（或刚断开）：进入等待。即使从没接上过也算"在运行"。
         running.store (true, std::memory_order_release);
 
-        // 等约 2 秒再重新找目标（找一次要对整张进程表拍快照，几十毫秒，不宜更密）；
-        //   期间 5ms 一步补静音（与采集循环的轮询节奏一致），stop() 最多迟滞一步
-        for (int step = 0; step < 400 && ! shouldStop.load (std::memory_order_acquire); ++step)
-        {
-            sink.emitSilenceIfDue (sampleRate);
-            Sleep (5);
-        }
+        // 等约 2 秒再重新找目标（找一次要对整张进程表拍快照，几十毫秒，不宜更密），期间持续补静音
+        sink.idle (sampleRate, 400, shouldStop);
     }
 }
 
@@ -762,6 +991,9 @@ namespace y2k
     WasapiLoopbackCapture::~WasapiLoopbackCapture() = default;
 
     void WasapiLoopbackCapture::setTargetProcess (const juce::String& exeName) { targetExeName = exeName; }
+    void WasapiLoopbackCapture::setTargetEndpoint (const juce::String& endpointId) { targetEndpointId = endpointId; }
+
+    juce::Array<WasapiLoopbackCapture::RenderEndpoint> WasapiLoopbackCapture::listRenderEndpoints() { return {}; }
 
     bool WasapiLoopbackCapture::start()
     {

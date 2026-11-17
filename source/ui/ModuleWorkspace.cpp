@@ -488,7 +488,9 @@ ModuleWorkspace::ModuleWorkspace()
     audioSourceBox.setTooltip (y2k::help::make ("Audio source",
         "What Y2Kmeter listens to. Output meters everything your computer plays; "
         "Microphone meters your input device."
+        "\nMicrophone lists your input devices; the first entry is the system default."
        #if JUCE_WINDOWS
+        "\nOutput lists your playback devices; the first entry follows the system default."
         "\nApp Audio Capture lists the apps that are playing audio right now; "
         "pick one to meter only that app's sound. "
         "Apps that are silent at the moment are under All Apps at the end of that list."

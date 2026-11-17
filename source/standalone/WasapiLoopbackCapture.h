@@ -3,8 +3,12 @@
 //   直接使用 Windows Core Audio（WASAPI）做回环采集，绕开 JUCE 的 AudioDeviceManager。
 //   两种采集目标：
 //
-//   1) 整机输出（默认）：采集"默认播放端点"的系统混音输出
+//   1) 整机输出（默认）：采集某个播放端点的系统混音输出
 //      （即电脑当前外放到扬声器/耳机的那股声音）。
+//        · 不指定端点 = 跟随系统"默认播放设备"：用户在系统里换了默认设备，
+//          采集自动跟过去；
+//        · setTargetEndpoint 指定端点 = 只采那一个播放设备，不管它是不是默认设备。
+//          设备被拔掉 / 禁用时不算失败：进入"等待"并持续输出静音，接回来自动续上。
 //
 //   2) 定向程序（setTargetProcess）：只采集某一个程序（连同它的子进程）发出的声音，
 //      其他程序的声音不进来 —— 与 OBS 的 "Application Audio Capture" 同一套系统能力
@@ -22,12 +26,14 @@
 //       WasapiLoopbackCapture cap;
 //       cap.onAudio = [](const float* L, const float* R, int n, double sr){ ... };
 //       cap.setTargetProcess ("chrome.exe");   // 可选；不调用 = 整机输出
+//       cap.setTargetEndpoint (endpointId);    // 可选；不调用 = 默认播放设备
 //       if (cap.start()) { ... cap.stop(); }
 //
 //   注意：
 //     · 输出统一为立体声 float32（若系统端点是 mono 则 L=R；若多声道则只取前两个）
-//     · sampleRate 以系统混音器的格式为准（常见 44100/48000）；
-//       定向程序模式下同样取默认播放端点的采样率，两种模式来回切不需要重新 prepare
+//     · sampleRate 以所采端点混音器的格式为准（常见 44100/48000），端点换了可能跟着变
+//       （onAudio 每次都带采样率，由上层决定要不要重新 prepare）；
+//       定向程序模式下取默认播放端点的采样率
 //     · 该类仅在 Windows 上可用；其他平台构造即失败 start() 返回 false
 // ==========================================================
 
@@ -58,12 +64,29 @@ public:
                                               double      sampleRate)>;
     AudioCallback onAudio;
 
+    // 一个播放端点（扬声器 / 耳机 / 虚拟声卡 ...）
+    struct RenderEndpoint
+    {
+        juce::String id;                  // 系统端点 ID（稳定、唯一；跨重启可持久化）
+        juce::String name;                // 给用户看的名字，如 "扬声器 (Realtek(R) Audio)"
+        bool         isDefault = false;   // 是不是系统当前的默认播放设备
+    };
+
+    // 列出当前可用（已启用且已接入）的播放端点，按名字排序；非 Windows 恒为空。
+    //   需要在已初始化 COM 的线程调用（JUCE 消息线程满足）。
+    static juce::Array<RenderEndpoint> listRenderEndpoints();
+
     // 设定采集目标程序（exe 文件名，如 "chrome.exe"；空串 = 整机输出）。
     //   只能在未运行时调用（先 stop() 再改目标再 start()）；运行中调用会被忽略。
     void setTargetProcess (const juce::String& exeName);
     const juce::String& getTargetProcess() const noexcept { return targetExeName; }
 
-    // 开启采集。失败返回 false（平台不支持、找不到默认端点、格式不支持等均返回 false）。
+    // 设定整机输出模式下要采集的播放端点（RenderEndpoint::id；空串 = 跟随系统默认播放设备）。
+    //   只在整机输出模式下生效（定向程序模式不分设备）；调用时机限制同 setTargetProcess。
+    void setTargetEndpoint (const juce::String& endpointId);
+    const juce::String& getTargetEndpoint() const noexcept { return targetEndpointId; }
+
+    // 开启采集。失败返回 false（平台不支持、找不到端点、格式不支持等均返回 false）。
     //   定向程序模式：目标程序没在运行**不算失败**（返回 true，进入等待）；
     //   只有系统不支持进程级回环、或已找到程序却建不起采集流时才返回 false。
     bool start();
@@ -95,7 +118,8 @@ private:
     std::atomic<bool>           failed { false };
     std::unique_ptr<std::thread> captureThread;
 
-    juce::String                targetExeName;   // 空 = 整机输出
+    juce::String                targetExeName;      // 空 = 整机输出
+    juce::String                targetEndpointId;   // 整机输出模式的端点；空 = 跟随默认播放设备
     juce::String                lastError;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (WasapiLoopbackCapture)

@@ -80,7 +80,7 @@
 
 **⑥ 桌面集成（Standalone 专属）**
 
-- 音频源选择：麦克风 / 桌面系统音频采集（macOS 走 ScreenCaptureKit、Windows 走 WASAPI Loopback）/ **定向程序音频采集**（仅 Windows 10 2004+：Source 下拉的 "App Audio Capture" 子菜单里列出此刻正在出声的程序，其余程序收在末尾的 "All Apps" 二级子菜单，选中后只采该程序连同其子进程的声音，同 OBS 的 Application Audio Capture；详见 §5.2.1）
+- 音频源选择：麦克风（"Microphone" 子菜单里选输入设备，第一项 "Default (设备名)" 是系统默认输入设备）/ 桌面系统音频采集（macOS 走 ScreenCaptureKit、Windows 走 WASAPI Loopback；Windows 下 "Output" 子菜单里选播放设备，第一项 "Default (设备名)" 跟随系统默认播放设备）/ **定向程序音频采集**（仅 Windows 10 2004+：Source 下拉的 "App Audio Capture" 子菜单里列出此刻正在出声的程序，其余程序收在末尾的 "All Apps" 二级子菜单，选中后只采该程序连同其子进程的声音，同 OBS 的 Application Audio Capture；详见 §5.2.1）
 - 无边框窗口 + 自定义标题栏（关闭 / 置顶 / 最小化 / 布局锁定 / 双击标题栏全屏）
 - 模块脱离 / 停靠（浮动窗口）、预设导出 / 导入（Save / Load）
 - 自动更新检查、可选匿名遥测、新手引导（右键添加 VirtuPet → 播放音频孵化）
@@ -297,7 +297,7 @@
 | 文件 | 作用 |
 | --- | --- |
 | [Y2KStandaloneApp.cpp](/I:/Y2KMeter/source/standalone/Y2KStandaloneApp.cpp) | 自实现 `juce::JUCEApplication` + `Y2KMainWindow`（DocumentWindow）替换 JUCE 内建的 `StandaloneFilterApp`；启动 → 加载 settings → 创建 Processor+Editor → 绑定 Loopback 音源 → 恢复主题/FPS/位置/尺寸/固定态 |
-| [WasapiLoopbackCapture.h/.cpp](/I:/Y2KMeter/source/standalone/WasapiLoopbackCapture.h) | Windows：裸 WASAPI 回环采集器，输出统一立体声 float32。两种目标共用一条采集循环：① 整机输出（默认）= 默认播放端点 + `AUDCLNT_STREAMFLAGS_LOOPBACK`；② 定向程序（`setTargetProcess("chrome.exe")`）= 进程级回环（`ActivateAudioInterfaceAsync` + `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE`），目标没在运行时进入"等待"并持续输出静音，启动后自动接上 |
+| [WasapiLoopbackCapture.h/.cpp](/I:/Y2KMeter/source/standalone/WasapiLoopbackCapture.h) | Windows：裸 WASAPI 回环采集器，输出统一立体声 float32。两种目标共用一条采集循环：① 整机输出（默认）= 播放端点 + `AUDCLNT_STREAMFLAGS_LOOPBACK`，不指定端点时跟随系统默认播放设备，`setTargetEndpoint(endpointId)` 指定后只采那一个设备（设备被拔掉时进入"等待"、接回自动续上；`listRenderEndpoints()` 枚举端点并标出默认设备）；② 定向程序（`setTargetProcess("chrome.exe")`）= 进程级回环（`ActivateAudioInterfaceAsync` + `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE`），目标没在运行时进入"等待"并持续输出静音，启动后自动接上 |
 | [AppAudioTargets.h/.cpp](/I:/Y2KMeter/source/standalone/AppAudioTargets.h) | Windows：定向程序采集的目标枚举 / 解析（`y2k::appaudio`）。`listCapturableApps()` 返回全量列表（音频会话 + 可见顶层窗口），每项带 `isActive`（有 Active 状态的音频会话 = 此刻正在出声），按 exe 去重、解析到同名进程树根、显示名取版本资源 FileDescription；`resolveTargetProcessId()` 把 exe 名解析成当前该采的 PID。非 Windows 为空实现 |
 | [MacDesktopAudioCapture.h/.mm](/I:/Y2KMeter/source/standalone/MacDesktopAudioCapture.h) | macOS：`ScreenCaptureKit` 获取桌面音频（Objective-C++） |
 | [AudioDumpRecorder.h/.cpp](/I:/Y2KMeter/source/standalone/AudioDumpRecorder.h) | **仅 macOS**，通过环境变量 `Y2KM_AUDIO_DUMP` 系列开启，把音频原样落盘做调试 |
@@ -447,8 +447,19 @@ main
 | sourceId | 含义 | 实现 |
 | --- | --- | --- |
 | `input:default` | 麦克风 / 默认输入设备 | JUCE `AudioDeviceManager` → `processBlock` |
-| `loopback:default` | 整机输出 | Win `WasapiLoopbackCapture`（端点回环）/ macOS `MacDesktopAudioCapture` / 其他平台虚拟回环输入设备 |
+| `input:device:<设备名>` | 麦克风 / 指定的输入设备（当前 deviceType 下的设备名） | 同上，`setup.inputDeviceName` 写指定的名字 |
+| `loopback:default` | 整机输出，跟随系统默认播放设备 | Win `WasapiLoopbackCapture`（端点回环）/ macOS `MacDesktopAudioCapture` / 其他平台虚拟回环输入设备 |
+| `loopback:device:<端点 ID>` | 整机输出，指定的播放设备（**仅 Windows**） | `WasapiLoopbackCapture::setTargetEndpoint` → 该端点的回环 |
 | `app:<exe 文件名>` | 定向程序（如 `app:chrome.exe`，**仅 Windows 10 2004+**） | `WasapiLoopbackCapture::setTargetProcess` → 进程级回环 |
+
+设备子菜单的要点（Source 下拉的 "Microphone" / "Output"）：
+
+- **第一项永远是默认设备**：两个子菜单都是 "Default (设备名)"，`sourceId` 仍是 `input:default` / `loopback:default`（老存档不用迁移）；其后每个设备一项。带设备名的文字在 `populateAudioSources` 里按当前界面语言拼好（模板 "Default ({0})" 是翻译键，读不到设备名时退回已有的 "Default"；设备名嵌在中间，显示层的整串延迟翻译对不上），所以 Standalone 订阅了语言切换、切换后重拼一遍。
+- **"Output" 子菜单仅 Windows**：macOS（ScreenCaptureKit）与其他平台（虚拟回环输入）的系统输出采集不分设备，仍是顶层的一项 "Output"；读到 `loopback:device:*` 的存档按系统输出处理。
+- **播放设备用系统端点 ID 标识**（稳定、唯一、可跨重启持久化），显示名每次按 ID 从设备表里查（采集中途被拔掉时用内存里记住的名字，不持久化）。输入设备直接用 JUCE 的设备名（它本来就按名字开设备）。
+- **设备表**（`refreshAudioDeviceLists`）在下拉弹出前（重新扫描）与 `AudioDeviceManager` 的设备变化通知里刷新；当前在用的设备即使被拔掉也保留一项。
+- **指定的设备不在时的处理**：切换 / 启动恢复那一刻设备不在表里 → 静默改用默认设备；在表里却开不起来 → 弹窗并回退到默认设备。采集中途被拔掉：播放设备 = 采集线程进入"等待"（每秒重试、期间输出静音），接回来自动续上；`loopback:default` 则每秒看一眼系统默认播放设备，换了就立刻改采新的（换端点采样率可能变，`onAudio` 带采样率，上层据此重新 `prepare`）。
+- **"Microphone" 子菜单的 "Default" 项不热跟随**：默认输入设备只在选中 / 启动恢复那一刻解析成具体设备名交给 `AudioDeviceManager`，运行中系统默认输入设备换了不会自动跟过去（与改动前的 "Microphone" 行为一致）。
 
 定向程序采集的要点（改这块前必读）：
 
@@ -459,7 +470,7 @@ main
 - **激活回调必须实现 `IAgileObject`**：`ActivateAudioInterfaceAsync` 在系统工作线程回调，缺这个标记会封送失败。`ProcessLoopbackActivation` 用 WRL 的 `RuntimeClass<ClassicCom, FtmBase, ...>` 实现（与微软示例同一写法）。
 - **程序列表只在下拉弹出前刷新**（`ModuleWorkspace::onAudioSourceListRequested` → Standalone 里重新调 `appaudio::listCapturableApps()`），平时零开销；当前目标即使已退出也保留一项。下拉条目 ID = `audioSourceItems` 下标 + 1，取选中项统一用 `getSelectedId() - 1`。程序列表收在 "App Audio Capture" 子菜单里（`AudioSourceItem::submenuPath` 是子菜单路径（`StringArray`，逐级一个名字），相邻的同路径项归一个子菜单，同一子菜单的条目必须连续添加；子菜单名同时是翻译键；当前选中项在子菜单里时标题也打勾；`sourceId` 为空的条目是灰显提示行，用于"当前没有程序在播放声音"）。
 - **程序列表的口径是"Active 会话"，不是"有会话"**：音频会话建立后只要进程活着就一直是 Inactive、不会过期（实测流全部释放后直到进程退出才 Expired），所以按"未过期会话"列会把 QQ / Discord / Steam 这类开过一次音频就再没出声的程序全列出来。EarTrumpet 源码（`AudioDeviceSessionCollection` / `AudioDeviceSession.State`）本身并不按"是否在出声"过滤，只剔除 Expired / 已断开（`OnSessionDisconnected`、进程退出）/ 被迁到别的设备的会话，而且这些状态是它常驻后台靠事件累积出来的，一次性快照拿不到；所以这里不照搬它，改用 `AudioSessionStateActive` 作为快照下"真正有音频活动"的判据。没在出声的程序（暂停中的播放器、只发提示音的程序、还没碰过音频的程序）不进主列表，统一收在末尾的 "All Apps" 二级子菜单里。
-- 整机回环与定向程序共用同一个采集器对象、同一条 `onAudio` → `AnalyserHub::pushStereo` 链路；换目标时先 `stop()`（同步 join）再 `setTargetProcess()`，不要在采集线程运行期间改 `onAudio`。
+- 整机回环与定向程序共用同一个采集器对象、同一条 `onAudio` → `AnalyserHub::pushStereo` 链路；换目标时先 `stop()`（同步 join）再 `setTargetProcess()` / `setTargetEndpoint()`，不要在采集线程运行期间改 `onAudio`。
 
 ### 5.3 布局持久化流程
 

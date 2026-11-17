@@ -694,6 +694,7 @@ public:
                 if (auto* y2kEditor = dynamic_cast<Y2KmeterAudioProcessorEditor*> (editor))
                 {
                     cachedEditor = y2kEditor;
+                    refreshAudioDeviceLists (false);
                     populateAudioSources (*y2kEditor);
 
                     y2kEditor->onAudioSourceChanged = [this](const juce::String& sourceId,
@@ -702,14 +703,23 @@ public:
                         handleAudioSourceChanged (sourceId, isLoopback);
                     };
 
-                    // Source 下拉即将弹出 → 重新枚举"可定向采集的程序"并刷新条目
-                    //   （程序随时开关，列表只在用户要看的那一刻刷新，平时零开销）
+                    // Source 下拉即将弹出 → 重新枚举输入 / 播放设备与"可定向采集的程序"并刷新条目
+                    //   （设备随时插拔、程序随时开关，列表只在用户要看的那一刻刷新，平时零开销）
                     y2kEditor->onAudioSourceListRequested = [this]()
                     {
                         appTargets = appaudio::listCapturableApps();
+                        refreshAudioDeviceLists (true);
                         if (cachedEditor != nullptr)
                             populateAudioSources (*cachedEditor);
                     };
+
+                    // "Default (设备名)" 这类条目的文字是按当前界面语言拼好的
+                    //   （设备名嵌在中间，显示层的整串延迟翻译对不上），切换语言后重拼一遍
+                    languageSubscription = y2k::i18n::subscribe ([this]()
+                    {
+                        if (cachedEditor != nullptr)
+                            populateAudioSources (*cachedEditor);
+                    });
 
                     // 预设 Save/Load —— 由 ModuleWorkspace 的 Save/Load 按钮触发，
                     //   Editor 透传过来。真正的 settings 文件读写只能在 Standalone App
@@ -736,14 +746,15 @@ public:
                    #endif
 
                     // 4.1) 恢复上次的 audio source（默认 "loopback:default"）
+                    //   · "input:device:<设备名>" / "loopback:device:<端点 ID>" = 指定的输入 / 播放设备。
+                    //     设备此刻不在（被拔掉 / 换了机器）时回退到对应的默认设备。
+                    //     指定播放设备仅 Windows；其他平台读到这种值时按"系统输出"处理。
                     //   · "app:<exe>" = 定向程序采集（仅 Windows）。程序此刻没在运行也照常恢复：
                     //     采集器会等它启动。其他平台读到这种值时按"系统输出"处理。
                     const auto savedSource = getUserSettings()
-                        .getValue ("audio.sourceId", "loopback:default");
-                    const bool savedLoopback = savedSource.startsWith ("loopback")
-                                            || savedSource.startsWith (kAppSourcePrefix);
+                        .getValue ("audio.sourceId", kLoopbackDefaultId);
                     rememberedAppDisplayName = getUserSettings().getValue ("audio.appDisplayName", {});
-                    handleAudioSourceChanged (savedSource, savedLoopback);
+                    handleAudioSourceChanged (savedSource, isLoopbackSourceId (savedSource));
                     syncDropdownToCurrentDevice (*y2kEditor);
 
                     // 4.2) 【已移到下面 mainWindow->setVisible(true) 之后】
@@ -953,6 +964,11 @@ public:
         // 0) 先取消对 AudioDeviceManager 的监听（它可能比 this 先析构）
         if (pluginHolder != nullptr)
             pluginHolder->deviceManager.removeChangeListener (this);
+        if (languageSubscription >= 0)
+        {
+            y2k::i18n::unsubscribe (languageSubscription);
+            languageSubscription = -1;
+        }
         cachedEditor = nullptr;
 
         // 1) 先让窗口不再持有 editor 的引用（setContentNonOwned 不拥有，这里只是解绑显示）
@@ -1606,7 +1622,7 @@ private:
             s.setValue ("ui.alwaysOnTop",    cachedEditor->isAlwaysOnTopActive());
         }
 
-        // getCurrentSourceId 已经封装了 loopback vs mic vs 定向程序 的判定
+        // getCurrentSourceId 已经封装了 loopback vs mic vs 定向程序、默认设备 vs 指定设备 的判定
         s.setValue ("audio.sourceId", getCurrentSourceId());
         // 定向程序采集：连同显示名一起记住 —— 下次启动时程序可能还没开，
         //   没法再从 exe 读版本信息，下拉里要有个像样的名字可显示。
@@ -1659,10 +1675,20 @@ private:
     // 音频源下拉：只暴露"语义化"的选项，避免把 N 个后端 × M 块物理设备的
     // 笛卡尔积全部罗列出来造成困扰。
     //
-    //   1) Microphone Input      —— 系统当前默认的输入设备（麦克风/声卡输入）
+    //   1) Microphone 子菜单     —— 输入设备（麦克风/声卡输入）
+    //        · 第一项 "Default (设备名)"：系统当前默认的输入设备
     //                              sourceId = "input:default"
-    //   2) System Output (Loopback) —— 系统默认渲染端点的混音输出（WASAPI loopback）
+    //        · 其后每个输入设备一项（当前 deviceType 下的设备表）
+    //                              sourceId = "input:device:<设备名>"
+    //   2) Output 子菜单（仅 Windows）—— 播放设备的混音输出（WASAPI loopback）
+    //        · 第一项 "Default (设备名)"：跟随系统默认播放设备
     //                              sourceId = "loopback:default"
+    //        · 其后每个播放端点一项，只采那一个设备（不管它是不是默认设备）
+    //                              sourceId = "loopback:device:<端点 ID>"
+    //      其他平台的系统输出采集不分设备（macOS ScreenCaptureKit / 虚拟回环输入），
+    //      仍是顶层的一项 "Output"。
+    //      · 设备表来自 refreshAudioDeviceLists()（下拉弹出前 / 设备变化时刷新）；
+    //      · 当前正在用的设备即使被拔掉 / 不在表里也保留一项，否则下拉框没东西可选中。
     //   3) 定向程序（仅 Windows 10 2004+）—— 收在 "App Audio Capture" 子菜单里，
     //      每个**此刻正在出声**的程序一项（音频会话处于 Active 状态），
     //      只采那个程序（含子进程）的声音，同 OBS 的 Application Audio Capture。
@@ -1680,15 +1706,47 @@ private:
     {
         juce::Array<Y2KmeterAudioProcessorEditor::AudioSourceEntry> items;
 
-        // 选项 1：麦克风输入（系统默认输入设备）
-        items.add ({ "Microphone",
-                     "input:default",
-                     false });
+        const juce::String currentId = getCurrentSourceId();
+
+        // 选项 1：麦克风输入 —— "Microphone" 子菜单：默认输入设备 + 每个输入设备一项
+        const juce::StringArray micMenu { kMicSubmenuName };
+
+        items.add ({ defaultDeviceLabel (defaultInputDeviceName),
+                     kInputDefaultId,
+                     false,
+                     micMenu });
+
+        for (const auto& name : inputDeviceNames)
+            items.add ({ clipDisplayName (name), makeInputSourceId (name), false, micMenu });
+
+        // 当前在用的输入设备已不在表里（被拔掉）：单独保留一项
+        if (currentId.startsWith (kInputDevicePrefix) && ! inputDeviceNames.contains (selectedInputDeviceName))
+            items.add ({ clipDisplayName (selectedInputDeviceName), currentId, false, micMenu });
 
         // 选项 2：系统输出回环（扬声器/耳机里正在播放的一切）
-        items.add ({ "Output",
-                     "loopback:default",
-                     true });
+       #if JUCE_WINDOWS
+        //   "Output" 子菜单：默认播放设备 + 每个播放端点一项
+        const juce::StringArray outputMenu { kOutputSubmenuName };
+
+        items.add ({ defaultDeviceLabel (defaultOutputDeviceName),
+                     kLoopbackDefaultId,
+                     true,
+                     outputMenu });
+
+        for (const auto& endpoint : outputEndpoints)
+            items.add ({ clipDisplayName (endpoint.name), makeOutputSourceId (endpoint.id), true, outputMenu });
+
+        // 当前在采的播放设备已不在表里（被拔掉 / 禁用，采集器在等它回来）：单独保留一项
+        const juce::String currentEndpoint = currentOutputEndpointId();
+        if (currentEndpoint.isNotEmpty() && findOutputEndpoint (currentEndpoint) == nullptr)
+            items.add ({ clipDisplayName (outputDeviceDisplayName (currentEndpoint)),
+                         currentId,
+                         true,
+                         outputMenu });
+       #else
+        //   系统输出采集不分设备：顶层的一项
+        items.add ({ "Output", kLoopbackDefaultId, true });
+       #endif
 
         // 选项 3..N：定向程序 —— 收进 "App Audio Capture" 子菜单：
         //   · 正在出声的程序直接列在子菜单里；
@@ -1702,7 +1760,7 @@ private:
         {
             // 当前目标沿用 currentExe 的大小写，保证与 getCurrentSourceId() 逐字相等
             const bool isCurrent = app.exeName.equalsIgnoreCase (currentExe);
-            items.add ({ clipAppDisplayName (app.displayName),
+            items.add ({ clipDisplayName (app.displayName),
                          makeAppSourceId (isCurrent ? currentExe : app.exeName),
                          true,
                          menu });
@@ -1721,7 +1779,7 @@ private:
         if (currentExe.isNotEmpty() && findAppTarget (currentExe) == nullptr)
         {
             // 当前目标已退出（采集器在等它回来）：哪个列表里都没有，单独保留一项
-            items.add ({ clipAppDisplayName (currentAppDisplayName()),
+            items.add ({ clipDisplayName (currentAppDisplayName()),
                          makeAppSourceId (currentExe),
                          true,
                          appMenu });
@@ -1741,7 +1799,123 @@ private:
             if (! app.isActive)
                 addApp (app, restMenu);
 
-        editor.setAudioSourceItems (items, getCurrentSourceId());
+        editor.setAudioSourceItems (items, currentId);
+    }
+
+    // ----------------------------------------------------
+    // 刷新 Source 下拉要用的设备表（只在消息线程调用）：
+    //   · 输入设备：当前 deviceType 下的设备名 + 默认输入设备名。
+    //     rescanInputs = 先让 deviceType 重新扫描一遍（下拉弹出前用，保证看到的是此刻的设备）；
+    //     否则直接读它已有的表（设备变化通知里用 —— 那时 deviceType 自己刚扫过）。
+    //   · 播放设备（仅 Windows）：活动的渲染端点 + 默认播放设备名。
+    // ----------------------------------------------------
+    void refreshAudioDeviceLists (bool rescanInputs)
+    {
+        refreshInputDeviceList (rescanInputs);
+        refreshOutputDeviceList();
+    }
+
+    void refreshInputDeviceList (bool rescan)
+    {
+        inputDeviceNames.clear();
+        defaultInputDeviceName.clear();
+
+        if (pluginHolder != nullptr)
+        {
+            if (auto* type = pluginHolder->deviceManager.getCurrentDeviceTypeObject())
+            {
+                if (rescan)
+                    type->scanForDevices();
+
+                inputDeviceNames = type->getDeviceNames (true /*wantInputNames*/);
+
+                const int idx = type->getDefaultDeviceIndex (true);
+                if (juce::isPositiveAndBelow (idx, inputDeviceNames.size()))
+                    defaultInputDeviceName = inputDeviceNames[idx];
+                else if (! inputDeviceNames.isEmpty())
+                    defaultInputDeviceName = inputDeviceNames[0];   // 兜底：取列表第一个
+            }
+        }
+    }
+
+    void refreshOutputDeviceList()
+    {
+        outputEndpoints = WasapiLoopbackCapture::listRenderEndpoints();
+
+        defaultOutputDeviceName.clear();
+        for (const auto& endpoint : outputEndpoints)
+            if (endpoint.isDefault)
+                defaultOutputDeviceName = endpoint.name;
+    }
+
+    // 设备子菜单第一项的文字："Default (设备名)"（两个子菜单共用，是哪种设备由子菜单名交代）；
+    //   读不到默认设备名时只有 "Default"。
+    //   带设备名的版本在这里就按当前界面语言拼好（模板 "Default ({0})" 是翻译键）；
+    //   不带的版本留英文源文案，由显示层延迟翻译。
+    static juce::String defaultDeviceLabel (const juce::String& deviceName)
+    {
+        return deviceName.isEmpty() ? juce::String ("Default")
+                                    : y2k::trf ("Default ({0})", clipDisplayName (deviceName));
+    }
+
+    // sourceId 去掉种类前缀后的部分（"app:chrome.exe" → "chrome.exe"）；不是这个种类则返回空串
+    static juce::String sourceIdPayload (const juce::String& sourceId, const char* prefix)
+    {
+        return sourceId.startsWith (prefix) ? sourceId.fromFirstOccurrenceOf (prefix, false, false)
+                                            : juce::String();
+    }
+
+    // 这个 sourceId 走不走回环采集（整机输出 / 指定播放设备 / 定向程序）；否则是硬件输入设备
+    static bool isLoopbackSourceId (const juce::String& sourceId)
+    {
+        return sourceId.startsWith ("loopback") || sourceId.startsWith (kAppSourcePrefix);
+    }
+
+    // "input:device:<设备名>" / "loopback:device:<端点 ID>" 形式的 sourceId（指定设备）的构造 / 反解。
+    //   反解：不是这种 sourceId 时返回空串（= 默认设备）。
+    static juce::String makeInputSourceId (const juce::String& deviceName)
+    {
+        return kInputDevicePrefix + deviceName;
+    }
+
+    static juce::String inputDeviceFromSourceId (const juce::String& sourceId)
+    {
+        return sourceIdPayload (sourceId, kInputDevicePrefix);   // 设备名要逐字匹配，不 trim
+    }
+
+    static juce::String makeOutputSourceId (const juce::String& endpointId)
+    {
+        return kLoopbackDevicePrefix + endpointId;
+    }
+
+    static juce::String outputEndpointFromSourceId (const juce::String& sourceId)
+    {
+        return sourceIdPayload (sourceId, kLoopbackDevicePrefix).trim();
+    }
+
+    // 回环采集器当前指定的播放端点 ID（空 = 跟随默认播放设备 / 定向程序 / 没在回环）。只在消息线程调用。
+    juce::String currentOutputEndpointId() const
+    {
+        return (loopback != nullptr && loopbackActive.load (std::memory_order_acquire))
+                   ? loopback->getTargetEndpoint()
+                   : juce::String();
+    }
+
+    const WasapiLoopbackCapture::RenderEndpoint* findOutputEndpoint (const juce::String& endpointId) const
+    {
+        for (const auto& endpoint : outputEndpoints)
+            if (endpoint.id == endpointId)
+                return &endpoint;
+        return nullptr;
+    }
+
+    // 播放端点的显示名：设备表里有就用表里的，其次用记住的，最后退回端点 ID
+    juce::String outputDeviceDisplayName (const juce::String& endpointId) const
+    {
+        if (const auto* endpoint = findOutputEndpoint (endpointId))
+            return endpoint->name;
+
+        return rememberedOutputDeviceName.isNotEmpty() ? rememberedOutputDeviceName : endpointId;
     }
 
     // "app:<exe>" 形式的 sourceId（定向程序采集）的构造 / 反解。
@@ -1753,9 +1927,7 @@ private:
 
     static juce::String appExeFromSourceId (const juce::String& sourceId)
     {
-        return sourceId.startsWith (kAppSourcePrefix)
-                   ? sourceId.fromFirstOccurrenceOf (kAppSourcePrefix, false, false).trim()
-                   : juce::String();
+        return sourceIdPayload (sourceId, kAppSourcePrefix).trim();
     }
 
     // 回环采集器当前的定向目标 exe（空 = 整机输出 / 没在回环）。只在消息线程调用。
@@ -1785,15 +1957,15 @@ private:
                                                      : appaudio::fallbackDisplayName (exe);
     }
 
-    // 版本资源里的描述偶尔很长，下拉菜单里截一下
-    static juce::String clipAppDisplayName (const juce::String& name)
+    // 版本资源里的描述 / 设备名偶尔很长，下拉菜单里截一下
+    static juce::String clipDisplayName (const juce::String& name)
     {
         constexpr int maxChars = 40;
         return name.length() > maxChars ? name.substring (0, maxChars - 3).trimEnd() + "..."
                                         : name;
     }
 
-    // 拼装"当前正在使用的音频源"的 sourceId（三种语义化值之一）
+    // 拼装"当前正在使用的音频源"的 sourceId（见 populateAudioSources 上方的列表）
     juce::String getCurrentSourceId() const
     {
         // loopbackActive = Windows WASAPI loopback 或 macOS ScreenCaptureKit 采集进行中
@@ -1804,19 +1976,29 @@ private:
         {
             // 回环采集器当前的目标是某个程序而不是整机输出
             const juce::String appExe = currentAppExe();
-            return appExe.isNotEmpty() ? makeAppSourceId (appExe)
-                                       : juce::String ("loopback:default");
+            if (appExe.isNotEmpty())
+                return makeAppSourceId (appExe);
+
+            // 整机输出：指定了播放设备，还是跟随默认设备
+            const juce::String endpointId = currentOutputEndpointId();
+            return endpointId.isNotEmpty() ? makeOutputSourceId (endpointId)
+                                           : juce::String (kLoopbackDefaultId);
         }
 
-        return "input:default";
+        return selectedInputDeviceName.isNotEmpty() ? makeInputSourceId (selectedInputDeviceName)
+                                                    : juce::String (kInputDefaultId);
     }
 
     // ----------------------------------------------------
     // 用户在下拉里选择了一个音频源：
-    //   · "loopback:default" → 启动 WasapiLoopbackCapture 捕捉默认渲染端点；
+    //   · "loopback:default" → 启动 WasapiLoopbackCapture 捕捉默认渲染端点（跟随系统默认播放设备）；
     //                         同时关闭 AudioDeviceManager 的物理设备（避免双路 push）
+    //   · "loopback:device:<端点 ID>" → （仅 Windows）同上，但只采指定的播放设备；
+    //                         失败时回退到 "loopback:default"
     //   · "input:default"    → 停掉 Loopback（若在跑），打开系统默认输入设备
-    //                         （让 AudioDeviceManager 自己挑当前 deviceType 下的默认）
+    //                         （当前 deviceType 下的默认）
+    //   · "input:device:<设备名>" → 同上，但打开指定的输入设备；
+    //                         设备不在 / 打不开时回退到默认输入设备
     //   · "app:<exe>"        → （仅 Windows）同一个采集器改成进程级回环，只采该程序；
     //                         失败时回退到 "loopback:default"
     // ----------------------------------------------------
@@ -1843,21 +2025,36 @@ private:
         if (isLoopback)
         {
            #if JUCE_WINDOWS
-            // 回环采集的目标：空 = 整机输出；非空 = 定向程序（"app:<exe>"，进程级回环，
-            //   只采这个程序连同它的子进程）。两者走同一条路，只有失败时的回退不同。
+            // 回环采集的目标：
+            //   · appExe 非空 = 定向程序（"app:<exe>"，进程级回环，只采这个程序连同它的子进程）；
+            //   · 否则 = 整机输出，endpointId 非空 = 指定的播放设备，空 = 跟随默认播放设备。
+            //   三者走同一条路，只有失败时的回退不同。
             const juce::String appExe = appExeFromSourceId (sourceId);
+            juce::String endpointId   = outputEndpointFromSourceId (sourceId);
+
+            // 指定的播放设备不在设备表里（存档里的设备被拔掉 / 换了机器）：
+            //   静默改用默认播放设备，与输入设备的处理一致（见 enableInput）。
+            //   在表里却开不起来才算失败（下面弹窗 + 回退）。
+            if (endpointId.isNotEmpty() && findOutputEndpoint (endpointId) == nullptr)
+            {
+                DBG (juce::String ("[Y2K] playback device '") + outputDeviceDisplayName (endpointId)
+                         + "' is not available; using the default output");
+                endpointId.clear();
+            }
 
             // 1) 先停硬件输入 → AudioDeviceManager 把输入通道清零
             //    （保留输出设备不变；setAudioDeviceSetup 的 err 我们不强求成功）
             disableHardwareInput();
 
             // 2) 启动 Loopback 采集线程
-            if (startLoopbackCapture (appExe))
+            if (startLoopbackCapture (appExe, endpointId))
             {
-                // 记住显示名：程序退出后下拉里仍要显示它（采集器在等它回来）。
-                //   列表里查不到（启动时恢复上次的目标）就沿用从 settings 读回来的名字。
+                // 记住显示名：程序退出 / 设备拔掉后下拉里仍要显示它（采集器在等它回来）。
+                //   程序在列表里查不到（启动时恢复上次的目标）就沿用从 settings 读回来的名字。
                 if (const auto* app = findAppTarget (appExe))
                     rememberedAppDisplayName = app->displayName;
+                if (const auto* endpoint = findOutputEndpoint (endpointId))
+                    rememberedOutputDeviceName = endpoint->name;
 
                 DBG ("[Y2K] WASAPI Loopback capture started.");
                 return;
@@ -1866,28 +2063,34 @@ private:
             const juce::String errorDetail = (loopback != nullptr ? loopback->getLastError()
                                                                   : y2k::tr ("(unknown)"));
             const bool isAppCapture = appExe.isNotEmpty();
+            // 有具体目标（某个程序 / 指定的播放设备）：失败后还能退到"默认播放设备的整机输出"
+            const bool hasTarget    = isAppCapture || endpointId.isNotEmpty();
+
+            const juce::String message = hasTarget
+                ? y2k::tr (isAppCapture ? "Failed to capture audio from this app:"
+                                        : "Failed to capture audio from this playback device:") + "\n"
+                      + (isAppCapture ? appExe : outputDeviceDisplayName (endpointId)) + "\n" + errorDetail
+                      + "\n\n" + y2k::tr ("Falling back to Output.")
+                : y2k::tr ("Failed to start system output loopback:") + "\n"
+                      + errorDetail
+                      + "\n\n" + y2k::tr ("Falling back to Microphone.");
 
             juce::AlertWindow::showAsync (
                 juce::MessageBoxOptions()
                     .withIconType (juce::MessageBoxIconType::WarningIcon)
                     .withTitle (y2k::tr (isAppCapture ? "Application audio capture error"
                                                       : "System Loopback error"))
-                    .withMessage (isAppCapture
-                                      ? y2k::tr ("Failed to capture audio from this app:") + "\n"
-                                            + appExe + "\n" + errorDetail
-                                            + "\n\n" + y2k::tr ("Falling back to Output.")
-                                      : y2k::tr ("Failed to start system output loopback:") + "\n"
-                                            + errorDetail
-                                            + "\n\n" + y2k::tr ("Falling back to Microphone."))
+                    .withMessage (message)
                     .withButton (y2k::tr ("OK")),
                 nullptr);
 
-            // 定向程序失败 → 回退到"整机输出"（它再失败会继续回退到麦克风）；
-            // 整机输出失败 → 回退到"麦克风输入"
-            if (isAppCapture)
-                handleAudioSourceChanged ("loopback:default", true);
+            // 定向程序 / 指定播放设备失败 → 回退到"默认播放设备的整机输出"
+            //   （它再失败会继续回退到麦克风）；
+            // 默认播放设备的整机输出失败 → 回退到"麦克风输入"
+            if (hasTarget)
+                handleAudioSourceChanged (kLoopbackDefaultId, true);
             else
-                enableDefaultInput();
+                enableInput();
 
             if (cachedEditor != nullptr)
                 syncDropdownToCurrentDevice (*cachedEditor);
@@ -1966,7 +2169,7 @@ private:
                     // result == 3 (Close) 由 showSystemFontAlertAsync 内部关闭弹窗
                 });
 
-            enableDefaultInput();
+            enableInput();
             if (cachedEditor != nullptr)
                 syncDropdownToCurrentDevice (*cachedEditor);
             return;
@@ -1990,32 +2193,35 @@ private:
                     .withButton (y2k::tr ("OK")),
                 nullptr);
 
-            enableDefaultInput();
+            enableInput();
             if (cachedEditor != nullptr)
                 syncDropdownToCurrentDevice (*cachedEditor);
             return;
            #endif
         }
 
-        // "Microphone Input" → 先停 Loopback，再启用默认输入设备
+        // "Microphone" → 先停 Loopback，再启用输入设备（默认的 / 指定的）
         stopLoopbackCapture();
        #if JUCE_MAC
         stopMacDesktopAudioCapture();
        #endif
         virtualLoopbackInputActive.store (false, std::memory_order_release);
-        enableDefaultInput();
+        enableInput (inputDeviceFromSourceId (sourceId));
     }
 
     // ----------------------------------------------------
-    // 打开系统默认输入设备（当前 deviceType 下）——
-    //   · 必须**显式**把 deviceType 下的默认输入设备名写进 setup.inputDeviceName
+    // 打开输入设备（当前 deviceType 下）——
+    //   · requestedName 为空 = 系统默认输入设备；非空 = 指定的输入设备。
+    //     指定的设备不在设备表里（存档里的设备被拔掉 / 换了机器）时静默改用默认设备；
+    //     在表里却打不开时弹窗，再改用默认设备。
+    //   · 必须**显式**把设备名写进 setup.inputDeviceName（默认设备也要解析成具体名字）
     //     否则 JUCE 的 setAudioDeviceSetup 在 inputDeviceName.isEmpty() 时会主动
     //     channels.clear()（见 juce_AudioDeviceManager::updateSetupChannels），
     //     导致我们指定的 stereo bitmask 被抹掉 → 设备确实打开了但 active input channels = 0
     //     → processBlock 收到全 0 → 模块一动不动。
     //   · 通道 bitmask 先试 stereo；若物理设备只有 1 路输入则退化回 mono。
     // ----------------------------------------------------
-    void enableDefaultInput()
+    void enableInput (const juce::String& requestedName = {})
     {
         if (pluginHolder == nullptr) return;
         auto& adm = pluginHolder->deviceManager;
@@ -2024,22 +2230,21 @@ private:
         // 这里先确保 holder callback 已恢复
         attachHolderCallback();
 
-        // 1) 解析当前 deviceType 下的"默认输入设备名"
-        juce::String defaultInputName;
-        if (auto* type = adm.getCurrentDeviceTypeObject())
-        {
-            type->scanForDevices();
-            const auto names = type->getDeviceNames (true /*wantInputNames*/);
-            const int  idx   = type->getDefaultDeviceIndex (true);
-            if (juce::isPositiveAndBelow (idx, names.size()))
-                defaultInputName = names[idx];
-            else if (! names.isEmpty())
-                defaultInputName = names[0];   // 兜底：取列表第一个
-        }
+        // 1) 重新扫描当前 deviceType 下的输入设备，决定这次要开哪一个
+        refreshInputDeviceList (true);
 
-        if (defaultInputName.isEmpty())
+        const bool useDefault = requestedName.isEmpty() || ! inputDeviceNames.contains (requestedName);
+        if (useDefault && requestedName.isNotEmpty())
+            DBG (juce::String ("[Y2K] enableInput: '") + requestedName + "' is not available; using the default input");
+
+        const juce::String inputName = useDefault ? defaultInputDeviceName : requestedName;
+
+        // 下拉里选中的是哪一项（空 = 子菜单第一项 "Default (设备名)"）
+        selectedInputDeviceName = useDefault ? juce::String() : requestedName;
+
+        if (inputName.isEmpty())
         {
-            DBG ("[Y2K] enableDefaultInput: no input device available for current deviceType");
+            DBG ("[Y2K] enableInput: no input device available for current deviceType");
             juce::AlertWindow::showAsync (
                 juce::MessageBoxOptions()
                     .withIconType (juce::MessageBoxIconType::WarningIcon)
@@ -2055,7 +2260,7 @@ private:
         // 2) 把设备名 + 通道 bitmask 写进 setup
         juce::AudioDeviceManager::AudioDeviceSetup setup;
         adm.getAudioDeviceSetup (setup);
-        setup.inputDeviceName         = defaultInputName;
+        setup.inputDeviceName         = inputName;
         setup.useDefaultInputChannels = false;
         setup.inputChannels.clear();
         setup.inputChannels.setRange (0, 2, true);   // 前 2 ch（stereo）
@@ -2064,7 +2269,7 @@ private:
         if (err.isNotEmpty())
         {
             // 有些设备（例如 mono 麦克风）不支持 2 bit 通道 mask → 退回 1 ch
-            DBG (juce::String ("[Y2K] enableDefaultInput stereo failed: ") + err + "; retrying mono");
+            DBG (juce::String ("[Y2K] enableInput stereo failed: ") + err + "; retrying mono");
             setup.inputChannels.clear();
             setup.inputChannels.setRange (0, 1, true);
             err = adm.setAudioDeviceSetup (setup, true);
@@ -2072,21 +2277,29 @@ private:
         if (err.isNotEmpty())
         {
             // 再退一步：彻底让 JUCE 自己挑（useDefaultInputChannels=true）
-            DBG (juce::String ("[Y2K] enableDefaultInput mono failed: ") + err + "; retrying with default channels");
+            DBG (juce::String ("[Y2K] enableInput mono failed: ") + err + "; retrying with default channels");
             setup.useDefaultInputChannels = true;
             setup.inputChannels.clear();
             err = adm.setAudioDeviceSetup (setup, true);
         }
         if (err.isNotEmpty())
         {
-            DBG (juce::String ("[Y2K] Failed to enable default input: ") + err);
+            DBG (juce::String ("[Y2K] Failed to enable input '") + inputName + "': " + err);
             juce::AlertWindow::showAsync (
                 juce::MessageBoxOptions()
                     .withIconType (juce::MessageBoxIconType::WarningIcon)
                     .withTitle (y2k::tr ("Audio input error"))
-                    .withMessage (y2k::tr ("Failed to open the default input device:") + "\n" + err)
+                    .withMessage (useDefault
+                                      ? y2k::tr ("Failed to open the default input device:") + "\n" + err
+                                      : y2k::tr ("Failed to open this input device:") + "\n"
+                                            + inputName + "\n" + err
+                                            + "\n\n" + y2k::tr ("Falling back to Microphone."))
                     .withButton (y2k::tr ("OK")),
                 nullptr);
+
+            // 指定的设备打不开 → 改用默认输入设备（它再打不开会再弹一次窗，然后停手）
+            if (! useDefault)
+                enableInput();
             return;
         }
 
@@ -2098,7 +2311,7 @@ private:
         if (auto* dev = adm.getCurrentAudioDevice())
         {
             const int nin = dev->getActiveInputChannels().countNumberOfSetBits();
-            DBG (juce::String ("[Y2K] Default input device = ") + dev->getName()
+            DBG (juce::String ("[Y2K] Input device = ") + dev->getName()
                   + ", active in channels = " + juce::String (nin)
                   + ", sr="                    + juce::String (dev->getCurrentSampleRate())
                   + ", buf="                   + juce::String (dev->getCurrentBufferSizeSamples()));
@@ -2160,11 +2373,12 @@ private:
 
     // ----------------------------------------------------
     // WASAPI Loopback —— 启停
-    //   targetExe 为空 = 整机输出（默认渲染端点回环）；
-    //   非空（如 "chrome.exe"）= 定向程序采集（进程级回环）。
-    //   两种目标共用同一个采集器 / 同一条 onAudio 链路，区别只在采集器内部怎么开流。
+    //   targetExe 为空 = 整机输出（渲染端点回环）：
+    //     endpointId 为空 = 跟随系统默认播放设备；非空 = 只采指定的播放端点。
+    //   targetExe 非空（如 "chrome.exe"）= 定向程序采集（进程级回环，不分设备，endpointId 不起作用）。
+    //   各种目标共用同一个采集器 / 同一条 onAudio 链路，区别只在采集器内部怎么开流。
     // ----------------------------------------------------
-    bool startLoopbackCapture (const juce::String& targetExe = {})
+    bool startLoopbackCapture (const juce::String& targetExe = {}, const juce::String& endpointId = {})
     {
         if (pluginHolder == nullptr || pluginHolder->processor == nullptr)
             return false;
@@ -2177,17 +2391,20 @@ private:
 
         // 已经在采同一个目标：什么都不用动
         //   （也避免在采集线程运行期间改写 onAudio 这个 std::function）
-        if (loopback->isRunning() && loopback->getTargetProcess().equalsIgnoreCase (targetExe))
+        if (loopback->isRunning()
+            && loopback->getTargetProcess().equalsIgnoreCase (targetExe)
+            && loopback->getTargetEndpoint() == endpointId)
         {
             loopbackActive.store (true, std::memory_order_release);
             return true;
         }
 
-        // 目标变了（整机 ↔ 某程序 / 程序 A → 程序 B），或上次的线程已自行退出：
+        // 目标变了（整机 ↔ 某程序 / 程序 A → 程序 B / 换了播放设备），或上次的线程已自行退出：
         //   先同步停掉旧线程，再换目标。不走 stopLoopbackCapture() ——
         //   那会把 holder callback 接回去、马上又要摘掉，白白重启一次物理设备。
         loopback->stop();
         loopback->setTargetProcess (targetExe);
+        loopback->setTargetEndpoint (endpointId);
 
         // 关键：先彻底断开 pluginHolder 对 deviceManager 的 audio callback，
         //       确保 loopback 运行期间只有采集线程在 push AnalyserHub，杜绝并发 UAF
@@ -2250,7 +2467,9 @@ private:
             y2kProc->registerLoopbackRenderTime (elapsedMs, n, sr);
         };
 
-        const juce::String targetLabel = targetExe.isEmpty() ? juce::String ("output") : targetExe;
+        const juce::String targetLabel = targetExe.isNotEmpty() ? targetExe
+                                       : endpointId.isNotEmpty() ? "output:" + endpointId
+                                                                 : juce::String ("output");
         juce::ignoreUnused (targetLabel);   // 只给诊断日志用（日志关闭时宏不求值）
 
         if (! loopback->start())
@@ -2514,6 +2733,18 @@ private:
     {
         if (pluginHolder == nullptr || cachedEditor == nullptr) return;
         if (src != &pluginHolder->deviceManager) return;
+
+        refreshAudioDeviceLists (false);
+
+        // 指定的输入设备被 AudioDeviceManager 换掉了（设备消失后它会自己重新挑一个）：
+        //   下拉跟着实际在用的设备走。输入端此刻是关着的（回环采集中）就不动。
+        if (selectedInputDeviceName.isNotEmpty())
+        {
+            const auto actual = pluginHolder->deviceManager.getAudioDeviceSetup().inputDeviceName;
+            if (actual.isNotEmpty() && actual != selectedInputDeviceName)
+                selectedInputDeviceName = (actual == defaultInputDeviceName) ? juce::String() : actual;
+        }
+
         syncDropdownToCurrentDevice (*cachedEditor);
     }
 
@@ -2538,6 +2769,31 @@ private:
     // 裸指针缓存 —— 指向 pluginEditor.get() 动态转型后的具体类型
     //   · 用于 ChangeListener 回调里刷新下拉框；不拥有生命周期
     Y2KmeterAudioProcessorEditor*                   cachedEditor = nullptr;
+
+    // Source 下拉里 "Microphone" / "Output" 两个设备子菜单（以下均只在消息线程访问）。
+    //   sourceId：默认设备 = "input:default" / "loopback:default"；
+    //             指定设备 = "input:device:<设备名>" / "loopback:device:<端点 ID>"。
+    //   · selectedInputDeviceName   —— 当前指定的输入设备名（空 = 默认输入设备）。
+    //     指定的播放设备不单独存：以采集器为准，见 currentOutputEndpointId()。
+    //   · inputDeviceNames / defaultInputDeviceName / outputEndpoints / defaultOutputDeviceName
+    //     —— 设备表缓存，见 refreshAudioDeviceLists()
+    //   · rememberedOutputDeviceName —— 当前指定播放设备的显示名。采集中途设备被拔掉、
+    //     表里查不到时用它显示（只在内存里：启动时设备不在表里会直接改用默认设备，用不上存档）
+    static constexpr const char* kInputDefaultId       = "input:default";
+    static constexpr const char* kInputDevicePrefix    = "input:device:";
+    static constexpr const char* kLoopbackDefaultId    = "loopback:default";
+    static constexpr const char* kLoopbackDevicePrefix = "loopback:device:";
+    static constexpr const char* kMicSubmenuName       = "Microphone";   // 子菜单名（翻译键）
+    static constexpr const char* kOutputSubmenuName    = "Output";       // 子菜单名（翻译键）
+    juce::String                                    selectedInputDeviceName;
+    juce::StringArray                               inputDeviceNames;
+    juce::String                                    defaultInputDeviceName;
+    juce::Array<WasapiLoopbackCapture::RenderEndpoint> outputEndpoints;
+    juce::String                                    defaultOutputDeviceName;
+    juce::String                                    rememberedOutputDeviceName;
+
+    // 界面语言切换的订阅令牌（-1 = 没订阅）：切换后重拼 Source 下拉里带设备名的条目
+    int                                             languageSubscription = -1;
 
     // WASAPI Loopback 采集器 —— 选中 "Output"（整机输出）或某个定向程序时启用
     std::unique_ptr<WasapiLoopbackCapture>          loopback;
