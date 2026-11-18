@@ -43,6 +43,7 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>
+#include <commctrl.h>   // SetWindowSubclass（comctl32 由 juce_gui_basics 链接）
 
 namespace {
     // Windows AppBar（SHAppBarMessage）封装：把顶层窗口注册为 AppBar，
@@ -53,6 +54,43 @@ namespace {
         if (c == nullptr) return nullptr;
         auto* peer = c->getPeer();
         return peer != nullptr ? reinterpret_cast<HWND> (peer->getNativeHandle()) : nullptr;
+    }
+
+    // L 锁定态的原生缩放闸门。
+    //   JUCE 8 的无边框可缩放窗口在 WM_NCHITTEST 里自己模拟缩放边：窗口四周约一个
+    //   系统边框宽度的区域直接返回 HTLEFT / HTBOTTOMRIGHT ...，这条路不经过任何
+    //   Component，禁用 ResizableBorder / CornerComponent 拦不住。这里给 HWND 挂一个
+    //   子类过程，把"缩放边"命中改写成 HTCLIENT：边缘不再出现缩放光标、拖不动尺寸，
+    //   鼠标事件照常落到 JUCE 组件上。不碰窗口样式和 resizeLimits，所以切换时不会
+    //   重建窗口，程序自己发起的尺寸变化（Hide / Stick / 全屏还原）也不受影响。
+    LRESULT CALLBACK y2kResizeGateProc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                        UINT_PTR subclassId, DWORD_PTR)
+    {
+        if (msg == WM_NCDESTROY)
+            RemoveWindowSubclass (hwnd, y2kResizeGateProc, subclassId);
+        else if (msg == WM_SYSCOMMAND && (wParam & 0xfff0) == SC_SIZE)
+            return 0;   // 系统菜单里的"大小"
+
+        const LRESULT result = DefSubclassProc (hwnd, msg, wParam, lParam);
+
+        if (msg == WM_NCHITTEST && HTSIZEFIRST <= result && result <= HTSIZELAST)
+            return HTCLIENT;
+
+        return result;
+    }
+
+    // 挂上 / 摘掉上面的闸门。幂等；窗口还没有 HWND 时什么都不做。
+    void y2kSetUserResizeBlocked (juce::Component* window, bool blocked) noexcept
+    {
+        constexpr UINT_PTR kSubclassId = 0x59324B4C;   // 'Y2KL'
+
+        if (const HWND hwnd = y2kGetWindowHwnd (window))
+        {
+            if (blocked)
+                SetWindowSubclass (hwnd, y2kResizeGateProc, kSubclassId, 0);
+            else
+                RemoveWindowSubclass (hwnd, y2kResizeGateProc, kSubclassId);
+        }
     }
 
     // 窗口所在显示器的物理工作区（px）。不含本窗口的 AppBar 占位 —— 必须在
@@ -4861,6 +4899,9 @@ void Y2KmeterAudioProcessorEditor::parentHierarchyChanged()
    #endif
 
     juce::AudioProcessorEditor::parentHierarchyChanged();
+
+    // 顶层窗口重建 native 窗口（换 HWND）也会走到这里：把 L 的缩放闸门补到新窗口上
+    applyUserResizeGate();
 }
 
 void Y2KmeterAudioProcessorEditor::visibilityChanged()
@@ -5824,9 +5865,9 @@ void Y2KmeterAudioProcessorEditor::updateStickDockGeometry()
 // 窗口行为模型（v2.8.2 重构）
 // ----------------------------------------------------------
 //   ① L（布局锁定）—— 纯"交互闸门"：
-//        · 禁止拖动窗口（mouseDown 不启动 windowDragger）
-//        · 禁止用户缩放窗口（禁用 Editor / 顶层窗口上的缩放手柄）
 //        · 禁止编辑模块 / 贴画（workspace->setLayoutLocked）
+//        · 禁止用户缩放窗口（禁用 Editor / 顶层窗口上的缩放手柄；Windows 另在
+//          HWND 上拦掉窗口边缘的原生缩放，见 y2kSetUserResizeBlocked）
 //      **不再**修改任何 resizeLimits、**不再**移动/缩放窗口。
 //      旧实现靠 setResizeLimits(w,h,w,h) 锁尺寸，副作用是 setBoundsConstrained 会
 //      把窗口夹进工作区（stick 下被推下去）、Hide 期间的尺寸快照与锁冲突（解锁后
@@ -5903,8 +5944,17 @@ void Y2KmeterAudioProcessorEditor::applyUserResizeGate()
 
     gate (*this);
     if (auto* top = getTopLevelComponent())
+    {
         if (top != this)
+        {
             gate (*top);
+
+           #if JUCE_WINDOWS
+            // 窗口边缘的原生缩放不走上面的手柄组件，要在 HWND 上单独拦
+            y2kSetUserResizeBlocked (top, layoutLocked);
+           #endif
+        }
+    }
 }
 
 // AudioProcessorEditor::setResizeLimits 每次都会重建右下角缩放手柄 →
@@ -6338,8 +6388,9 @@ juce::String Y2KmeterAudioProcessorEditor::getTooltip()
     if (lockButtonHovered)
         return make ("Layout lock (L)",
                      layoutLocked
-                         ? juce::String ("LOCKED - modules and the window cannot be moved, resized or "
-                                         "closed. Buttons inside modules still work. Click to unlock.")
+                         ? juce::String ("LOCKED - modules cannot be moved, resized or closed, and the "
+                                         "window cannot be resized. Buttons inside modules still work. "
+                                         "Click to unlock.")
                          : juce::String ("Click to lock the layout so nothing moves by accident while "
                                          "you work. Buttons inside modules keep working."));
 
@@ -6597,12 +6648,12 @@ void Y2KmeterAudioProcessorEditor::mouseDown(const juce::MouseEvent& e)
 
     if (juce::JUCEApplicationBase::isStandaloneApp())
     {
-        // 锁定态 / stick 驻留态 / 伪全屏态：不启动顶层窗口拖拽。
+        // stick 驻留态 / 伪全屏态：不启动顶层窗口拖拽。
         //   stick 驻留态的几何由 AppBar 管理，拖动会与占位脱节；双击全屏也会
         //   破坏贴边矩形，因此 mouseDoubleClick 里同样对 stickActive 早退。
         //   伪全屏态拖动会让"进入前的 bounds"与实际窗口脱节（退出还原时跳回去），
         //   演出场景里也容易误拖把全屏窗口拖走，因此直接禁止；双击仍可退出全屏。
-        if (! layoutLocked && ! stickActive && ! pseudoFullScreen)
+        if (! stickActive && ! pseudoFullScreen)
         {
             if (auto* top = getTopLevelComponent())
             {

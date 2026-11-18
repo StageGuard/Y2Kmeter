@@ -62,7 +62,7 @@
 "Minimise" = "最小化"
 "Send the window to the taskbar / Dock. Audio analysis keeps running." = "把窗口收到任务栏 / 程序坞，音频分析继续运行。"
 "Layout lock (L)" = "布局锁定 (L)"
-"LOCKED - modules and the window cannot be moved, resized or closed. Buttons inside modules still work. Click to unlock." = "已锁定 —— 模块和窗口不能移动、缩放或关闭，模块内的按钮仍可使用。点击解锁。"
+"LOCKED - modules cannot be moved, resized or closed, and the window cannot be resized. Buttons inside modules still work. Click to unlock." = "已锁定 —— 模块不能移动、缩放或关闭，窗口不能缩放。模块内的按钮仍可使用。点击解锁。"
 "Click to lock the layout so nothing moves by accident while you work. Buttons inside modules keep working." = "点击锁定布局，避免工作时误拖动。模块内的按钮仍可正常使用。"
 "Title bar" = "标题栏"
 "Stick mode: the bar is docked to the screen edge. Use X / T/B in the toolbar to leave or flip it." = "吸附模式：窗口条已停靠在屏幕边缘。用工具栏里的 X / T/B 退出或切换上下。"

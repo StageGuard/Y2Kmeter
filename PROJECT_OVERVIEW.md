@@ -347,9 +347,8 @@
 - **Chrome 隐藏态**：Hide 按钮收缩窗口；实现"幂等化" —— Hide 前完整快照 bounds 与 resizeLimits，Show 时直接 setBounds 回快照，避免累积漂移。
 - **双击标题栏切换全屏**（v1.8.2 新增，v2.6.0 后按平台拆分）：`mouseDoubleClick` 中命中 `getTitleBarBounds()` 且避开按钮与标题文字热区后，走 `toggleFakeFullScreen()` —— **macOS** 调用 `rw->setFullScreen(!isFullScreen())` 进入系统原生全屏（独立 Space、隐藏菜单栏/Dock）；**Windows** 保留 v2.5.8 的伪最大化（setBounds 到 userArea，避免覆盖任务栏及 PopupMenu Z 序遮挡）。仅 Standalone 非 chrome 隐藏态下生效，插件宿主模式不接管。切换前先把 `draggingWindow=false` 复位，避免上一帧 `mouseDown` 启动的 `windowDragger` 残留拖拽态。
 - **布局锁定按钮 L**（v1.8.3 新增）：位于顶栏「最小化 _」按钮左侧，从右到左依次为 `× / * / _ / L`。点击切换 `layoutLocked`，同步 `ModuleWorkspace::setLayoutLocked` 与 Processor `setLayoutLocked`（XML 属性 `layoutLocked="1"` 序列化）。锁定时：
-  - 顶层窗口通过 `setResizeLimits(cur, cur, cur, cur)` 冻结尺寸（**不用 `setResizable(false, ...)`，那会重建 native 窗口导致闪现**），Editor 双击标题栏切全屏仍可用（因为 fullscreen 不走 resize limits）。
-  - Editor::mouseDown 在锁定态跳过 `windowDragger.startDraggingComponent`，即无法拖动窗口。
-  - 关键接口：`isLayoutLocked() / handleLockClicked() / applyLayoutLocked(locked, initial)` + 构造期延迟 flag `pendingLockApplyOnAttach`（顶层窗口尺寸未就绪时先记账，`visibilityChanged` 时再应用，避免构造期 assert）。
+  - 窗口尺寸靠"闸门"冻结，不改 `resizeLimits`、不调 `setResizable(false, ...)`（后者会重建 native 窗口导致闪现）：`applyUserResizeGate()` 禁用 Editor 右下角与顶层窗口上的缩放手柄；Windows 另通过 `y2kSetUserResizeBlocked`（`SetWindowSubclass`）把 `WM_NCHITTEST` 的缩放边命中改写成 `HTCLIENT` —— JUCE 8 对无边框可缩放窗口在窗口边缘模拟的原生缩放不经过任何 Component，只禁手柄拦不住。锁定态双击标题栏也不进全屏（仍可从伪全屏还原）。程序自己发起的尺寸变化（Hide / Stick / 全屏还原）不受闸门影响。
+  - 关键接口：`isLayoutLocked() / handleLockClicked() / applyLayoutLocked(locked, initial) / applyUserResizeGate()`（后者幂等，在 `visibilityChanged / parentHierarchyChanged / childrenChanged` 里重套，保证缩放手柄或 HWND 重建后闸门仍在）。
 - 顶部三按钮几何：`getCloseButtonBounds / getPinButtonBounds / getMinimiseButtonBounds`；chrome 隐藏态特殊：`getFloatingCloseButtonBounds`。
 - **VirtuPet 保活**：只有当工作区存在 VirtuPet 模块时，Editor 才 `hub.retain(Kind::Loudness)` 保持信号驱动状态机。
 - **Milkdrop 收藏库桥接（v2.7.1 新增）**：`IsMilkdropUseLikeLibrary` / `RequestMilkdropToggleLibrary` / `ToggleMilkdropLibraryState` / `SetMilkdropUseLikeLibrary` / `RequestMilkdropUnlinkReload` / `HasMilkdropLikedPresets` / `GetMilkdropCurrentPresetFilePath`；`renderOpenGL` 消费库切换与取消收藏重扫请求，维护双向索引记忆 `milkdrop_builtin_preset_index_ / milkdrop_like_preset_index_`。

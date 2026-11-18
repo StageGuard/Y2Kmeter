@@ -548,7 +548,7 @@ private:
     bool lockButtonHovered    = false;   // v1.8.3
     bool lockButtonPressed    = false;
     bool alwaysOnTopActive    = true;  // 固定按钮当前状态：默认启用（置顶不被遮挡）
-    bool layoutLocked         = false; // v1.8.3：布局锁定态（抱锁后不可拖动/resize）
+    bool layoutLocked         = false; // v1.8.3：布局锁定态（锁模块布局 + 窗口尺寸）
 
     // stick 模式是否激活（Windows 专属；非 Windows 恒 false，供 paint 判断隐藏按钮）
     bool stickActive = false;
@@ -623,7 +623,7 @@ private:
     // =====================================================================
     // 窗口行为模型（v2.8.2 重构）
     //   三个概念相互独立、职责单一：
-    //   ① L（layoutLocked）：纯"交互闸门"——禁止拖动/缩放窗口、禁止编辑模块。
+    //   ① L（layoutLocked）：纯"交互闸门"——禁止编辑模块、禁止用户缩放窗口。
     //      不再改 resizeLimits、不再移动/缩放窗口；切换 L 永远不会让窗口跳动。
     //   ② Hide（autoHideMode）：标题栏 + 工具栏收起。
     //      · 进入/退出时窗口一次性收缩/展开 chrome 高度（上半屏顶边固定、下半屏
@@ -664,7 +664,8 @@ private:
     int  getChromeHeightPx() const noexcept;
     void drawTitleBar (juce::Graphics& g);
 
-    // L 闸门：启用/禁用顶层窗口边框 + Editor 右下角的缩放手柄（不碰 resizeLimits）
+    // L 闸门：启用/禁用顶层窗口边框 + Editor 右下角的缩放手柄（不碰 resizeLimits）；
+    //   Windows 上另拦掉窗口边缘的原生缩放（JUCE 在 WM_NCHITTEST 里模拟的缩放边）
     void applyUserResizeGate();
 
     // —— 无边框窗口拖拽支持（仅在 Standalone 下起作用，VST3 宿主中无害）——

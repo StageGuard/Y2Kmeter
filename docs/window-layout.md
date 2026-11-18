@@ -4,17 +4,17 @@
 
 三个独立子系统，不再互相耦合：
 
-- **L（布局锁定）** = 纯交互闸门：锁窗口尺寸/位置 + 所有子组件位置/尺寸/存在性。
+- **L（布局锁定）** = 纯交互闸门：锁窗口尺寸 + 所有子组件位置/尺寸/存在性。
 - **Hide（auto-hide）** = 一次性几何收缩 + 悬停浮层。
 - **Stick** = 驻留条状布局（AppBar 占位）。
 
 ## 2. 布局锁定（L 按钮）关键规则
 
-- **冻结窗口用 `setResizeLimits(cur,cur,cur,cur)`，不要用 `setResizable(false)`** —— 后者重建 native HWND（DWM 重绘）→ 整屏闪一下。
-- **构造期只记意图**：`pendingLockApplyOnAttach=true`，等 `visibilityChanged`（顶层已 attach、尺寸就绪）再 `applyLayoutLocked`；否则 0×0 触发 jassert。
+- **冻结窗口尺寸靠闸门（`applyUserResizeGate`），不改 `resizeLimits`，也不要用 `setResizable(false)`** —— 后者重建 native HWND（DWM 重绘）→ 整屏闪一下；改 limits 会经 `setBoundsConstrained` 把窗口夹进工作区（stick 下被推走）。
+- **Windows 的窗口边缘缩放不经过 Component**：JUCE 8 在 `WM_NCHITTEST` 里给无边框可缩放窗口模拟缩放边，只禁用 `ResizableBorder/CornerComponent` 拦不住；要用 `y2kSetUserResizeBlocked`（`SetWindowSubclass`，把缩放边命中改成 `HTCLIENT`）。闸门幂等，在 `visibilityChanged / parentHierarchyChanged / childrenChanged` 重套。macOS 的原生边缘缩放目前没有对应闸门。
 - **分层下沉冻结**：父级拦不住子组件；`ModulePanel`/`VirtuPetModule`/`ModuleWorkspace` 各自的 `mouseMove/mouseDown/mouseDoubleClick/isInterestedInFileDrag` 都要早退（`isPanelLayoutLocked` 上溯查询）。
 - 锁定态 clamp 守卫加 `!isLayoutLocked()`（意外 resize 不压缩模块）。
-- **保留可用**（否则用户被锁死）：顶栏 4 按钮、双击标题栏切全屏（fullscreen 不走 resize limits）、底部 toolbar 全部（主题/Save-Load/FPS/GAIN/Source/Hide）。
+- **保留可用**（否则用户被锁死）：顶栏 4 按钮、从伪全屏双击还原（锁定态不能双击进入全屏）、底部 toolbar 全部（主题/Save-Load/FPS/GAIN/Source/Hide）。
 
 ## 3. auto-hide（Hide 按钮）关键机制
 
